@@ -1,5 +1,8 @@
 #define DEBUG true
 
+#include <stdio.h>
+#include <math.h>
+#include <cstring>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_MLX90614.h>
@@ -19,8 +22,21 @@
 #include <tensorflow/lite/micro/micro_interpreter.h>
 #include <tensorflow/lite/micro/micro_error_reporter.h>
 #include <tensorflow/lite/schema/schema_generated.h>
+#include <kiss_fft.h>
+
 #include "scaler.h"
 #include "model_data.h"
+#include "mfcc_data.h"
+
+// Constants for DSP
+#define SAMPLE_RATE 16000
+#define N_FFT 1024
+#define N_MELS 128
+#define N_MFCC 40
+#define HOP_LENGTH 512
+#define DURATION_SECONDS 1
+#define FRAME_COUNT ((SAMPLE_RATE / HOP_LENGTH) + 1) // 32 frames for 1 second
+#define INPUT_SIGNAL_LENGTH (SAMPLE_RATE * DURATION_SECONDS)
 
 // Pin definitions
 // Note - Do not use pin 35, 36, 37 since it is used for SPI communication between Flash and PSRAM in Octal SPI memory mode
@@ -70,7 +86,9 @@ void MQTTcallback(char* topic, byte* payload, unsigned int length);
 void readButtonTask(void *pvParameters);
 void monitorWiFi(void *pvParameters);
 void readMLX90614(void *pvParameters);
-bool I2CMutexTake();
+
+void extract_mfcc(const float *audio_signal, float *output_mfcc);
+void scale_mfcc(float* mfcc_buffer, size_t frame_count, size_t n_mfcc);
 
 // Sensor and display objects
 MAX30105 max30102;
@@ -105,16 +123,69 @@ PubSubClient mqttClient(espClient);
 // first read flag
 bool firstGPSRead = false;
 
+// scaler mean, scaler std, dct matrix and mel filterbank pointers for PSRAM allocation
+float* scaler_mean_PSRAM;
+float* scaler_std_PSRAM;
+float* dct_matrix_PSRAM;
+float* mel_filterbank_PSRAM;
+
+// kiss_fft_cfg static allocation
+static uint8_t kiss_fft_buffer[8456];
+kiss_fft_cfg kissfft_cfg;
+
 void setup() {
   // Initialize Serial for debugging
   Serial.begin(115200);
 
   // Print PSRAM size and RAM/heap size
   #if DEBUG
+  Serial.printf("Initial PSRAM size: %d\n", ESP.getPsramSize());
+  Serial.printf("Initial PSRAM free: %d\n", ESP.getFreePsram());
+  Serial.printf("Initial Heap size: %d\n", ESP.getHeapSize());
+  Serial.printf("Initial Free heap: %d\n", ESP.getFreeHeap());
+  #endif
+
+  // Allocate PSRAM for scaler mean, scaler std, dct matrix and mel filterbank
+  scaler_mean_PSRAM = (float*) heap_caps_malloc(sizeof(mfcc_mean), MALLOC_CAP_SPIRAM);
+  scaler_std_PSRAM = (float*) heap_caps_malloc(sizeof(mfcc_std), MALLOC_CAP_SPIRAM);
+  dct_matrix_PSRAM = (float*) heap_caps_malloc(sizeof(dct_matrix), MALLOC_CAP_SPIRAM);
+  mel_filterbank_PSRAM = (float*) heap_caps_malloc(sizeof(mel_filterbank), MALLOC_CAP_SPIRAM);
+
+  if(scaler_mean_PSRAM == NULL || scaler_std_PSRAM == NULL || dct_matrix_PSRAM == NULL || mel_filterbank_PSRAM == NULL) {
+    #if DEBUG
+    Serial.println("Failed to allocate PSRAM");
+    #endif
+    while(1) {vTaskDelay(10/portTICK_PERIOD_MS);}
+  }
+
+  // Print PSRAM size and RAM/heap size
+  #if DEBUG
+  Serial.println("PSRAM allocated");
   Serial.printf("PSRAM size: %d\n", ESP.getPsramSize());
   Serial.printf("PSRAM free: %d\n", ESP.getFreePsram());
   Serial.printf("Heap size: %d\n", ESP.getHeapSize());
   Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
+  #endif
+
+  // Copy scaler mean, scaler std, dct matrix and mel filterbank to PSRAM
+  memcpy(scaler_mean_PSRAM, mfcc_mean, sizeof(mfcc_mean));
+  memcpy(scaler_std_PSRAM, mfcc_std, sizeof(mfcc_std));
+  memcpy(dct_matrix_PSRAM, dct_matrix, sizeof(dct_matrix));
+  memcpy(mel_filterbank_PSRAM, mel_filterbank, sizeof(mel_filterbank));
+
+  // Initialize kiss_fft_cfg
+  size_t lenmem = 8456;
+  kissfft_cfg = kiss_fft_alloc(N_FFT, 0, kiss_fft_buffer, &lenmem);
+  if(kissfft_cfg == NULL) {
+    #if DEBUG
+    Serial.println("Failed to allocate kiss_fft_cfg");
+    Serial.printf("kiss_fft_cfg size: %d\n", lenmem);
+    #endif
+    while(1) {vTaskDelay(10/portTICK_PERIOD_MS);}
+  }
+
+  #if DEBUG
+  Serial.println("kiss_fft_cfg allocated");
   #endif
 
   // Button
@@ -216,6 +287,11 @@ void setup() {
 
   // Create I2C Mutex
   i2cSemaphore = xSemaphoreCreateMutex();
+  if(i2cSemaphore == NULL) {
+    #if DEBUG
+    Serial.println("Failed to create I2C semaphore");
+    #endif
+  }
 
   // Create FreeRTOS tasks
   xTaskCreate(readMPU6050, "Read MPU6050", 4096, NULL, 1, NULL);                // accelerometer and gyroscope
@@ -225,7 +301,7 @@ void setup() {
   xTaskCreate(aggregateData, "Aggregate Data", 2048, NULL, 1, NULL);            // aggregate data and send to queue
   xTaskCreate(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL);   // publish data to MQTT
   xTaskCreate(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL);                // monitor WiFi
-  xTaskCreate(readINMP441, "Read INMP441", 49152, NULL, 0, NULL);               // read sound sensor
+  xTaskCreate(readINMP441, "Read INMP441", 100000, NULL, 0, NULL);               // read sound sensor
   // xTaskCreate(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL);           // temperature
   // xTaskCreate(readButtonTask, "Read Button", 4096, NULL, 1, NULL);           // read button press
 }
@@ -247,10 +323,22 @@ void readMPU6050(void *pvParameters) {
   float prevAccelZ = 0.0;
 
   while (1) {
+    // take semaphore
+    // if(xSemaphoreTake(i2cSemaphore, portMAX_DELAY) != pdTRUE) {
+    //   #if DEBUG
+    //   Serial.println("Failed to take I2C semaphore");
+    //   #endif
+    //   vTaskDelay(5 / portTICK_PERIOD_MS);
+    //   continue;
+    // }
+
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     lastAccelValue = a;
     lastGyroValue = g;
+
+    // release semaphore
+    // xSemaphoreGive(i2cSemaphore);
 
     // convert acceleration to g from m/s^2
     float acceleration_x_mg = a.acceleration.x/9.8;
@@ -303,12 +391,27 @@ void readMAX30102(void *pvParameters) {
   //read the first 100 samples, and determine the signal range
   for (byte i = 0 ; i < bufferLength ; i++)
   {
+    // take semaphore
+    // if(xSemaphoreTake(i2cSemaphore, portMAX_DELAY) != pdTRUE) {
+    //   #if DEBUG
+    //   Serial.println("Failed to take I2C semaphore");
+    //   #endif
+
+    //   // dont skip sample
+    //   i--;
+    //   vTaskDelay(5 / portTICK_PERIOD_MS);
+    //   continue;
+    // }
+
     while (max30102.available() == false) //do we have new data?
       max30102.check(); //Check the sensor for new data
 
     redBuffer[i] = max30102.getRed();
     irBuffer[i] = max30102.getIR();
     max30102.nextSample(); //We're finished with this sample so move to next sample
+
+    // release semaphore
+    // xSemaphoreGive(i2cSemaphore);
 
     // Serial.print(F("red="));
     // Serial.print(redBuffer[i], DEC);
@@ -334,12 +437,27 @@ void readMAX30102(void *pvParameters) {
     for (byte i = 75; i < 100; i++)
     {
       // take semaphore
+      // if(xSemaphoreTake(i2cSemaphore, portMAX_DELAY) != pdTRUE) {
+      //   #if DEBUG
+      //   Serial.println("Failed to take I2C semaphore");
+      //   #endif
+
+      //   // dont skip sample
+      //   i--;
+      //   vTaskDelay(5 / portTICK_PERIOD_MS);
+      //   continue;
+      // }
+
       while (max30102.available() == false) //do we have new data?
         max30102.check(); //Check the sensor for new data
 
       redBuffer[i] = max30102.getRed();
       irBuffer[i] = max30102.getIR();
       max30102.nextSample(); //We're finished with this sample so move to next sample
+
+      // release semaphore
+      // xSemaphoreGive(i2cSemaphore);
+      // vTaskDelay(5 / portTICK_PERIOD_MS);
 
       //send samples and calculation result to terminal program through UART
       // Serial.print(F("red="));
@@ -414,6 +532,8 @@ void readINMP441(void *pvParameters) {
   Serial.println("Reading INMP441 Task Started");
   #endif
 
+  UBaseType_t uxHighWaterMark;
+
   // read audio data at 16kHz
   // setup I2S
   i2s_config_t i2s_config = {
@@ -442,8 +562,8 @@ void readINMP441(void *pvParameters) {
   #endif
   
   // 1 second buffer 
-  // int32_t* audioData = (int32_t*) heap_caps_malloc(SAMPLE_RATE * sizeof(int32_t), MALLOC_CAP_SPIRAM);
-  int32_t audioData[SAMPLE_RATE];
+  float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
+  // int32_t audioData[SAMPLE_RATE];
   size_t bytesRead;
 
   if(!audioData) {
@@ -510,21 +630,70 @@ void readINMP441(void *pvParameters) {
   // Get output tensor
   TfLiteTensor* output = interpreter.output(0);
 
+  // Get input tensor dimensions
+  int input_dims = input->dims->size;
+  int batch_size = input->dims->data[0];
+  int n_frame = input->dims->data[1];
+  int n_mfcc = input->dims->data[2];
+  int channels = input->dims->data[3];
+   printf("Model expects input shape: [%d, %d, %d, %d]\n", batch_size, n_frame, n_mfcc, channels);
+
+  float mfcc_buffer[FRAME_COUNT * N_MFCC];
+
   while(1) {
     // read 1 second of audio data
-    // for(int i = 0; i < SAMPLE_RATE; i++) {
-    //   i2s_read(I2S_NUM_0, &audioData[i], sizeof(uint32_t), &bytesRead, portMAX_DELAY);
+    for(int i = 0; i < SAMPLE_RATE; i++) {
+      // i2s_read(I2S_NUM_0, &audioData[i], sizeof(float), &bytesRead, portMAX_DELAY);
+      audioData[i] = 1.0;
+    }
+
+    uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+    Serial.printf("High water mark: %d\n", uxHighWaterMark);
+
+    // extract MFCC features (32 frames, 40 coefficients)
+    extract_mfcc(audioData, mfcc_buffer);
+
+    // print MFCC
+    for(int i = 0; i < FRAME_COUNT; i++) {
+      Serial.printf("Frame %d: ", i);
+      for(int j = 0; j < N_MFCC; j++) {
+        Serial.printf("%.2f ", mfcc_buffer[i * N_MFCC + j]);
+      }
+      Serial.println();
+    }
+
+    // scale MFCC features
+    scale_mfcc(mfcc_buffer, FRAME_COUNT, N_MFCC);
+    
+    // print MFCC
+    for(int i = 0; i < FRAME_COUNT; i++) {
+      Serial.printf("Frame %d: ", i);
+      for(int j = 0; j < N_MFCC; j++) {
+        Serial.printf("%.2f ", mfcc_buffer[i * N_MFCC + j]);
+      }
+      Serial.println();
+    }
+
+
+    // // copy scaled MFCC features to input tensor
+    // memcpy(input->data.f, mfcc_buffer, FRAME_COUNT * N_MFCC * sizeof(float));
+
+    // // do inference
+    // if(interpreter.Invoke() != kTfLiteOk) {
+    //   error_reporter->Report("Invoke failed");
+    //   while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
     // }
 
-    // TODO: MFCC
+    // // TODO: if cough detected, send notification
+    // // if output value is > 0.9 then cough detected
+    // float output_value = output->data.f[0];
+    // if(output_value > 0.9) {
+    //   #if DEBUG
+    //   Serial.println("Cough detected!");
+    //   #endif
+    // }
 
-    // TODO: scaling
-
-    // TODO: do inference
-
-    // TODO: if cough detected, send notification
-
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Delay 1 second
+    vTaskDelay(pdMS_TO_TICKS(100)); // Delay 100ms
   }
 }
 
@@ -698,4 +867,105 @@ void monitorWiFi(void *pvParameters) {
     }
     vTaskDelay(1000/portTICK_PERIOD_MS);
   }
+}
+
+// dsp functions
+// Hann window function
+void hann_window(float *window, int size) {
+    for (int i = 0; i < size; i++) {
+        window[i] = 0.5 * (1 - cos((2 * M_PI * i) / (size - 1)));
+    }
+}
+
+// Perform FFT and calculate power spectrum
+void compute_power_spectrum(const float *frame, float *power_spectrum, int size) {
+    // kiss_fft_cfg cfg = kiss_fft_alloc(size, 0, NULL, NULL);
+    // if(cfg == NULL) {
+    //     #if DEBUG
+    //     Serial.println("Failed to allocate kiss_fft_cfg");
+    //     #endif
+    //     while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
+    // }
+
+    kiss_fft_cpx in[N_FFT], out[N_FFT];
+    // kiss_fft_cpx* in = (kiss_fft_cpx*) heap_caps_malloc(size * sizeof(kiss_fft_cpx), MALLOC_CAP_SPIRAM);
+    // kiss_fft_cpx* out = (kiss_fft_cpx*) heap_caps_malloc(size * sizeof(kiss_fft_cpx), MALLOC_CAP_SPIRAM);
+
+    for (int i = 0; i < size; i++) {
+        in[i].r = frame[i];
+        in[i].i = 0.0;
+    }
+
+    kiss_fft(kissfft_cfg, in, out);
+
+    for (int i = 0; i <= size / 2; i++) {
+        power_spectrum[i] = (out[i].r * out[i].r) + (out[i].i * out[i].i);
+    }
+
+    // free(cfg);
+}
+
+// Apply Mel filterbank
+void apply_mel_filterbank(const float *power_spectrum, float *mel_energy) {
+    for (int i = 0; i < N_MELS; i++) {
+        mel_energy[i] = 0.0;
+        for (int j = 0; j <= N_FFT / 2; j++) {
+            mel_energy[i] += mel_filterbank[i][j] * power_spectrum[j];
+        }
+        mel_energy[i] = logf(mel_energy[i] + 1e-10); // Log scale
+    }
+}
+
+// Apply DCT to Mel energies
+void apply_dct(const float *mel_energy, float *mfcc) {
+    for (int i = 0; i < N_MFCC; i++) {
+        mfcc[i] = 0.0;
+        for (int j = 0; j < N_MELS; j++) {
+            mfcc[i] += dct_matrix[i][j] * mel_energy[j];
+        }
+    }
+}
+
+// Main MFCC extraction function
+void extract_mfcc(const float *audio_signal, float *output_mfcc) {
+    float hann[N_FFT];
+    float frame[N_FFT];
+    float power_spectrum[(N_FFT / 2) + 1];
+    float mel_energy[N_MELS];
+
+    hann_window(hann, N_FFT);
+
+    for (int frame_idx = 0; frame_idx < FRAME_COUNT; frame_idx++) {
+        // Compute frame start index
+        int frame_start = frame_idx * HOP_LENGTH - N_FFT / 2;
+
+        // Apply Hann window
+        for (int i = 0; i < N_FFT; i++) {
+            if (frame_start + i < 0 || frame_start + i >= INPUT_SIGNAL_LENGTH) {
+                frame[i] = 0.0; // Zero padding
+            } else {
+                frame[i] = audio_signal[frame_start + i] * hann[i];
+            }
+        }
+
+        // Compute power spectrum
+        compute_power_spectrum(frame, power_spectrum, N_FFT);
+
+        // Apply Mel filterbank
+        apply_mel_filterbank(power_spectrum, mel_energy);
+
+        // Apply DCT to get MFCCs
+        apply_dct(mel_energy, &output_mfcc[frame_idx * N_MFCC]);
+    }
+}
+
+void scale_mfcc(float* mfcc_buffer, size_t frame_count, size_t n_mfcc) {
+    // expect mfcc_buffer to be an array[frame_count * n_mfcc]
+    for (size_t frame = 0; frame < frame_count; ++frame) {
+        for (size_t mfcc = 0; mfcc < n_mfcc; ++mfcc) {
+            size_t index = frame * n_mfcc + mfcc;
+            // Normalize using mean and standard deviation
+            mfcc_buffer[index] = (mfcc_buffer[index] - scaler_mean_PSRAM[mfcc]) / scaler_std_PSRAM[mfcc];
+        }
+    }
 }
