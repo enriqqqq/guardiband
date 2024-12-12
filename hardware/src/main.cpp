@@ -301,7 +301,7 @@ void setup() {
   xTaskCreate(aggregateData, "Aggregate Data", 2048, NULL, 1, NULL);            // aggregate data and send to queue
   xTaskCreate(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL);   // publish data to MQTT
   xTaskCreate(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL);                // monitor WiFi
-  xTaskCreate(readINMP441, "Read INMP441", 100000, NULL, 0, NULL);               // read sound sensor
+  xTaskCreate(readINMP441, "Read INMP441", 116700, NULL, 0, NULL);               // read sound sensor
   // xTaskCreate(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL);           // temperature
   // xTaskCreate(readButtonTask, "Read Button", 4096, NULL, 1, NULL);           // read button press
 }
@@ -530,9 +530,11 @@ void readINMP441(void *pvParameters) {
 
   #if DEBUG
   Serial.println("Reading INMP441 Task Started");
+  UBaseType_t uxHighWaterMark;
+  // for debugging inference latency
+  unsigned long inference_start_time;
   #endif
 
-  UBaseType_t uxHighWaterMark;
 
   // read audio data at 16kHz
   // setup I2S
@@ -562,8 +564,8 @@ void readINMP441(void *pvParameters) {
   #endif
   
   // 1 second buffer 
-  float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
-  // int32_t audioData[SAMPLE_RATE];
+  // float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
+  float audioData[SAMPLE_RATE];
   size_t bytesRead;
 
   if(!audioData) {
@@ -602,9 +604,10 @@ void readINMP441(void *pvParameters) {
   resolver.AddDequantize();
 
   // Define the tensor arena (use PSRAM)
-  constexpr int tensor_arena_size = 100 * 1024;
+  constexpr int tensor_arena_size = 8 * 1024;
 
-  uint8_t* tensor_arena = (uint8_t*) heap_caps_malloc(tensor_arena_size, MALLOC_CAP_SPIRAM);
+  // uint8_t* tensor_arena = (uint8_t*) heap_caps_malloc(tensor_arena_size, MALLOC_CAP_SPIRAM);
+  uint8_t* tensor_arena = (uint8_t*) malloc(tensor_arena_size);
   if(tensor_arena == NULL) {
     error_reporter->Report("Failed to allocate tensor arena");
     while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
@@ -640,58 +643,67 @@ void readINMP441(void *pvParameters) {
 
   float mfcc_buffer[FRAME_COUNT * N_MFCC];
 
+
   while(1) {
     // read 1 second of audio data
     for(int i = 0; i < SAMPLE_RATE; i++) {
       // i2s_read(I2S_NUM_0, &audioData[i], sizeof(float), &bytesRead, portMAX_DELAY);
-      audioData[i] = 1.0;
+      // audioData[i] = 1.0; // all ones
+
+      audioData[i] = 0.5 * sin(2 * PI * 1000 * i / SAMPLE_RATE); // sine wave of 1kHz
     }
 
+    // for(int i = 0; i < SAMPLE_RATE; i++) {
+    //   Serial.println(audioData[i]);
+    // }
+
+    // starting time
+
+    #if DEBUG
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
-    Serial.printf("High water mark: %d\n", uxHighWaterMark);
+    Serial.printf("INMP441 - High water mark: %d\n", uxHighWaterMark);
+    Serial.println("INMP441 - 1 second of audio data read, inference starting...");
+    inference_start_time = millis();
+    #endif
+
 
     // extract MFCC features (32 frames, 40 coefficients)
     extract_mfcc(audioData, mfcc_buffer);
 
-    // print MFCC
-    for(int i = 0; i < FRAME_COUNT; i++) {
-      Serial.printf("Frame %d: ", i);
-      for(int j = 0; j < N_MFCC; j++) {
-        Serial.printf("%.2f ", mfcc_buffer[i * N_MFCC + j]);
-      }
-      Serial.println();
-    }
-
     // scale MFCC features
     scale_mfcc(mfcc_buffer, FRAME_COUNT, N_MFCC);
+
+    // print scald mfcc
+    // for(int i = 0; i < FRAME_COUNT; i++) {
+    //   Serial.println("Frame " + String(i));
+    //   for(int j = 0; j < N_MFCC; j++) {
+    //     Serial.print(mfcc_buffer[i * N_MFCC + j]);
+    //     Serial.print(" ");
+    //   }
+    //   Serial.println();
+    // }
     
-    // print MFCC
-    for(int i = 0; i < FRAME_COUNT; i++) {
-      Serial.printf("Frame %d: ", i);
-      for(int j = 0; j < N_MFCC; j++) {
-        Serial.printf("%.2f ", mfcc_buffer[i * N_MFCC + j]);
-      }
-      Serial.println();
+    // copy scaled MFCC features to input tensor
+    memcpy(input->data.f, mfcc_buffer, FRAME_COUNT * N_MFCC * sizeof(float));
+
+    // do inference
+    if(interpreter.Invoke() != kTfLiteOk) {
+      error_reporter->Report("Invoke failed");
+      while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
     }
 
-
-    // // copy scaled MFCC features to input tensor
-    // memcpy(input->data.f, mfcc_buffer, FRAME_COUNT * N_MFCC * sizeof(float));
-
-    // // do inference
-    // if(interpreter.Invoke() != kTfLiteOk) {
-    //   error_reporter->Report("Invoke failed");
-    //   while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
-    // }
-
-    // // TODO: if cough detected, send notification
-    // // if output value is > 0.9 then cough detected
-    // float output_value = output->data.f[0];
-    // if(output_value > 0.9) {
-    //   #if DEBUG
-    //   Serial.println("Cough detected!");
-    //   #endif
-    // }
+    // TODO: if cough detected, send notification
+    // if output value is > 0.9 then cough detected
+    float output_value = output->data.f[0];
+    #if DEBUG
+    Serial.println("INMP441 - Inference latency: " + String(millis() - inference_start_time) + "ms");
+    Serial.printf("INMP441 - Output value: %.6f\n", output_value);
+    #endif
+    if(output_value > 0.9) {
+      #if DEBUG
+      Serial.println("Cough detected!");
+      #endif
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100)); // Delay 100ms
   }
@@ -961,11 +973,7 @@ void extract_mfcc(const float *audio_signal, float *output_mfcc) {
 
 void scale_mfcc(float* mfcc_buffer, size_t frame_count, size_t n_mfcc) {
     // expect mfcc_buffer to be an array[frame_count * n_mfcc]
-    for (size_t frame = 0; frame < frame_count; ++frame) {
-        for (size_t mfcc = 0; mfcc < n_mfcc; ++mfcc) {
-            size_t index = frame * n_mfcc + mfcc;
-            // Normalize using mean and standard deviation
-            mfcc_buffer[index] = (mfcc_buffer[index] - scaler_mean_PSRAM[mfcc]) / scaler_std_PSRAM[mfcc];
-        }
+    for(int i = 0; i < frame_count * n_mfcc; i++) {
+        mfcc_buffer[i] = (mfcc_buffer[i] - scaler_mean_PSRAM[i]) / scaler_std_PSRAM[i];
     }
 }
