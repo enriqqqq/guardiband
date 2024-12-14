@@ -33,6 +33,7 @@
 #include "images/pulse_icon.h"
 #include "images/spo2_icon.h"
 #include "images/temp_icon.h"
+#include "images/message_icon.h"
 
 // Constants for DSP
 #define SAMPLE_RATE 16000
@@ -68,6 +69,12 @@
 #define MQTT_PUBLISH_TOPIC "guardiband/1A/data"
 #define MQTT_SUBSCRIBE_TOPIC "guardiband/1A/message"
 
+#define LEDC_CHANNEL 0      // LEDC channel (0-15)
+#define LEDC_TIMER   0      // Timer (0-3)
+#define LEDC_RESOLUTION 13 // Timer resolution bits
+#define LEDC_FREQUENCY 262 // Default frequency (Do)
+#define LEDC_DUTY     4096 // 50% duty cycle (0-8191 for 13-bit resolution)
+
 // sensorData struct
 typedef struct {
   float bpm;
@@ -92,6 +99,7 @@ void MQTTcallback(char* topic, byte* payload, unsigned int length);
 void readButtonTask(void *pvParameters);
 void monitorWiFi(void *pvParameters);
 void readMLX90614(void *pvParameters);
+void updateTime(void *pvParameters);
 
 void extract_mfcc(const float *audio_signal, float *output_mfcc);
 void scale_mfcc(float* mfcc_buffer, size_t frame_count, size_t n_mfcc);
@@ -117,12 +125,16 @@ String lastMessage = "";
 // Queue for sensor data
 QueueHandle_t sensorDataQueue;
 
-// I2C Semaphore
-SemaphoreHandle_t i2cSemaphore;
+// Queue for message data
+QueueHandle_t readMessageMQTTQueue;
+
+// Semaphore for Buzzer
+SemaphoreHandle_t buzzerSemaphore;
 
 // WiFi Setup & MQTT
 WiFiManager wm;
-const char* mqtt_server = "broker.hivemq.com";
+// const char* mqtt_server = "broker.hivemq.com";
+const char* mqtt_server = "broker.emqx.io";
 unsigned long start_time = 0;
 
 WiFiClient espClient;
@@ -141,6 +153,35 @@ float* mel_filterbank_PSRAM;
 static uint8_t kiss_fft_buffer[8456];
 kiss_fft_cfg kissfft_cfg;
 
+// variable for tft display
+const int tft_width = 240;      // TFT display width
+const int text_width = 12;      // Width of text (in pixels)
+const int spacing_r2 = 25;      // Space between metrics
+const int icon_r_margin = 6;    // Right margin for icons
+const int start_y = 16;         // Starting y position for row 1
+const int y_spacing = 20;       // Y spacing between rows
+// Metric widths: Icon Width + Icon Right Margin + Text Width
+const int bpm_width = 32 + (3 * text_width) + icon_r_margin;
+const int temp_width = 32 + (4 * text_width) + icon_r_margin;  
+const int spo2_width = 32 + (4 * text_width) + icon_r_margin; 
+// Total width of metrics and spacing_r2
+int total_width_r2 = bpm_width + spo2_width + (1 * spacing_r2);
+// Calculate starting x position for centering
+int start_x_r2 = (tft_width - total_width_r2) / 2;
+int start_x_r1 = (tft_width - temp_width) / 2;
+const int y_spacing_box = 25;   // Y spacing between message box and metrics 
+const int message_box_padding = 4; // Padding for message box
+const int msg_icon_r_margin = 8; // Right margin for message icon
+int message_row_width = 15 * text_width + 2 * message_box_padding + 16 + msg_icon_r_margin; // 15 characters + x padding + icon width + icon right margin
+int message_start_x = (tft_width - message_row_width) / 2;
+
+// Config Time
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600; // GMT+7
+const int daylightOffset_sec = 0;   // No daylight saving time in GMT+7
+tm timeInfo;
+time_t currentTime = 0;
+
 void setup() {
   // Initialize Serial for debugging
   Serial.begin(115200);
@@ -152,6 +193,22 @@ void setup() {
   Serial.printf("Initial Heap size: %d\n", ESP.getHeapSize());
   Serial.printf("Initial Free heap: %d\n", ESP.getFreeHeap());
   #endif
+  
+  // Initialize TFT display
+  tft.begin(30000000); // Set the SPI clock frequency
+  tft.setRotation(1); // Set the display rotation
+  tft.fillScreen(GC9A01A_BLACK); // Clear the screen
+  tft.setTextSize(3);
+  tft.setTextColor(GC9A01A_BLACK);
+
+  // "Guardiband" with 2px padding on each side rectangle filled white
+  const int guardiband_text_w = 10*18;
+  const int guardiband_padding = 2;
+  const int start_x_guardiband = (tft_width - guardiband_text_w + 2*guardiband_padding) / 2;
+  const int guardiband_text_h = 24;
+  tft.fillRect(start_x_guardiband, 120-guardiband_padding-guardiband_text_h/2, guardiband_text_w + 2*guardiband_padding, guardiband_text_h + 2*guardiband_padding, GC9A01A_WHITE);
+  tft.setCursor(start_x_guardiband + guardiband_padding, 120-guardiband_text_h/2);
+  tft.print("Guardiband");
 
   // Allocate PSRAM for scaler mean, scaler std, dct matrix and mel filterbank
   scaler_mean_PSRAM = (float*) heap_caps_malloc(sizeof(mfcc_mean), MALLOC_CAP_SPIRAM);
@@ -196,6 +253,9 @@ void setup() {
   Serial.println("kiss_fft_cfg allocated");
   #endif
 
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQUENCY, LEDC_RESOLUTION);
+  ledcAttachPin(BUZZER_POSITIVE, LEDC_CHANNEL);
+
   // Button
   pinMode(BUTTON_PIN, INPUT);
 
@@ -204,12 +264,14 @@ void setup() {
   pinMode(BUZZER_NEGATIVE, OUTPUT);
   digitalWrite(BUZZER_NEGATIVE, LOW);
 
-  // Sound Buzzer (Do, Re, Mi)
-  tone(BUZZER_POSITIVE, 262, 200);
-  delay(200);
-  tone(BUZZER_POSITIVE, 294, 200);
-  delay(200);
-  tone(BUZZER_POSITIVE, 330, 200);
+  // Sound Buzzer (G4, E4, C4)
+  tone(BUZZER_POSITIVE, 392);
+  delay(500);
+  noTone(BUZZER_POSITIVE);
+  delay(500);
+  tone(BUZZER_POSITIVE, 1000);
+  delay(500);
+  noTone(BUZZER_POSITIVE);
 
   // Initialize I2C for MPU6050 and MAX30102
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -281,25 +343,17 @@ void setup() {
   // Initialize GPS
   Serial1.begin(9600, SERIAL_8N1, GPS_TX_PIN, GPS_RX_PIN);
 
-  // Initialize TFT display
-  tft.begin(30000000); // Set the SPI clock frequency
-  tft.setRotation(1); // Set the display rotation
-  tft.fillScreen(GC9A01A_BLACK); // Clear the screen
-  tft.setTextSize(2);
-  tft.setTextColor(GC9A01A_WHITE);
-  tft.setCursor(0, 120);
-  tft.print("Hello, World!");
-
   // Create SensorData queue
   sensorDataQueue = xQueueCreate(10, sizeof(sensorData_t));
 
-  // Create I2C Mutex
-  i2cSemaphore = xSemaphoreCreateMutex();
-  if(i2cSemaphore == NULL) {
-    #if DEBUG
-    Serial.println("Failed to create I2C semaphore");
-    #endif
-  }
+  // Create readMessageMQTT queue
+  readMessageMQTTQueue = xQueueCreate(5, 16*sizeof(char));
+
+  // Create Buzzer semaphore mutex
+  buzzerSemaphore = xSemaphoreCreateMutex();
+
+  // Set up WiFiManager
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
 
   // Create FreeRTOS tasks
   xTaskCreatePinnedToCore(readMPU6050, "Read MPU6050", 4096, NULL, 1, NULL, 1);                // accelerometer and gyroscope (Core 1)
@@ -310,6 +364,7 @@ void setup() {
   xTaskCreatePinnedToCore(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL, 1);   // publish data to MQTT (Core 1)
   xTaskCreatePinnedToCore(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL, 0);                // monitor WiFi (Core 0)
   xTaskCreatePinnedToCore(readINMP441, "Read INMP441", 116700, NULL, 0, NULL, 0);              // read sound sensor (Core 0)
+  xTaskCreatePinnedToCore(updateTime, "Update Time", 2048, NULL, 0, NULL, 0);                  // update time (Core 0)
   // xTaskCreatePinnedToCore(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL, 1);           // temperature (Core 1)
   // xTaskCreatePinnedToCore(readButtonTask, "Read Button", 4096, NULL, 1, NULL, 1);           // read button press (Core 1)
 }
@@ -359,6 +414,8 @@ void readMPU6050(void *pvParameters) {
       #if DEBUG
       Serial.println("Fall detected");
       #endif
+      String payload = "{\"type\":\"alert\", \"message\":\"SpO2 too low\"}";
+      mqttClient.publish(MQTT_PUBLISH_TOPIC, payload.c_str());
     }
 
     // print sensor data
@@ -436,12 +493,16 @@ void readMAX30102(void *pvParameters) {
         # if DEBUG
         Serial.println("MAX30102 - Heart rate too low");
         #endif
+        String payload = "{\"type\":\"alert\", \"message\":\"Heart rate too low\"}";
+        mqttClient.publish(MQTT_PUBLISH_TOPIC, payload.c_str());
       }
 
       if(spo2 < 80) {
         #if DEBUG
         Serial.println("MAX30102 - SpO2 too low");
         #endif
+        String payload = "{\"type\":\"alert\", \"message\":\"SpO2 too low\"}";
+        mqttClient.publish(MQTT_PUBLISH_TOPIC, payload.c_str());
       }
     }
   }
@@ -654,6 +715,7 @@ void readINMP441(void *pvParameters) {
   }
 }
 
+// THIS CODE IS WAY TOO MESSY, DON'T TRY TO UNDERSTAND IT
 void updateTFTDisplay(void *pvParameters) {
   // clear
   tft.fillScreen(GC9A01A_BLACK);
@@ -662,28 +724,9 @@ void updateTFTDisplay(void *pvParameters) {
 
   #if DEBUG
   // draw middle lines
-  tft.drawLine(0, 120, 240, 120, GC9A01A_WHITE);
-  tft.drawLine(120, 0, 120, 240, GC9A01A_WHITE);
+  // tft.drawLine(0, 120, 240, 120, GC9A01A_WHITE);
+  // tft.drawLine(120, 0, 120, 240, GC9A01A_WHITE);
   #endif
-
-  const int tft_width = 240;      // TFT display width
-  const int text_width = 12;      // Width of text (in pixels)
-  const int spacing_r2 = 25;      // Space between metrics
-  const int icon_r_margin = 6;    // Right margin for icons
-  const int start_y = 16;         // Starting y position for row 1
-  const int y_spacing = 20;       // Y spacing between rows
-
-  // Metric widths: Icon Width + Icon Right Margin + Text Width
-  const int bpm_width = 32 + (3 * text_width) + icon_r_margin;
-  const int temp_width = 32 + (4 * text_width) + icon_r_margin;  
-  const int spo2_width = 32 + (4 * text_width) + icon_r_margin; 
-
-  // Total width of metrics and spacing_r2
-  int total_width_r2 = bpm_width + spo2_width + (1 * spacing_r2);
-
-  // Calculate starting x position for centering
-  int start_x_r2 = (tft_width - total_width_r2) / 2;
-  int start_x_r1 = (tft_width - temp_width) / 2;
 
   // draw temperature icon (row 1)
   drawIconFromPROGMEM(start_x_r1, start_y, temp_icon, 32, 32);
@@ -702,20 +745,75 @@ void updateTFTDisplay(void *pvParameters) {
   
   tft.setTextSize(2);
 
-  const int y_spacing_box = 40;   // Y spacing between message box and metrics 
-  int message_start_x = (tft_width - 15 * text_width) / 2;
+  // draw message icon
+  drawIconFromPROGMEM(message_start_x, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding, message_icon, 16, 16);
 
-  // message box
-  tft.setCursor(message_start_x, start_y + 32 + y_spacing + 32 + y_spacing_box);
-  tft.print("this_is_a_msg_1"); // 15 characters
-  tft.drawRect(
-    message_start_x, 
-    start_y + 32 + y_spacing + 32 + y_spacing_box, 
-    15 * text_width, 
-    16, 
-    GC9A01A_WHITE);
+  // draw message box
+  tft.drawRoundRect(
+    message_start_x + 16 + msg_icon_r_margin, 
+    start_y + 32 + y_spacing + 32 + y_spacing_box - message_box_padding + 4, 
+    15 * text_width + 2 * message_box_padding, 
+    16 + 2 * message_box_padding, 
+    4, 
+    GC9A01A_WHITE
+  );
 
+  // print message
+  tft.setCursor(message_start_x + 16 + msg_icon_r_margin + message_box_padding, start_y + 32 + y_spacing + 32 + y_spacing_box + 4);
+  tft.print("..............."); // 15 characters
+  
+  // print time template
+  const int date_time_ref = 88;
+  const int time_y_spacing = 15;
+  const int time_text_h = 24;
+  const int time_text_w = 16; 
+  const int distance_from_middle = 10;
+  const int date_box_padding = 4;
+
+  tft.setTextSize(3);
+  tft.setCursor(date_time_ref - distance_from_middle - time_text_w*2, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing);
+  tft.print("HH");
+  tft.setCursor(date_time_ref - distance_from_middle - time_text_w*2, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing + time_text_h + 4);
+  tft.print("MM");
+
+  // print date, mon, day template
+  tft.setCursor(date_time_ref + distance_from_middle, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing + time_text_h + 4 + date_box_padding);
+  tft.setTextSize(2);
+  tft.print("DAYDAYDAY");
+
+  // set background to DD
+  tft.fillRoundRect(
+    date_time_ref + distance_from_middle - date_box_padding,
+    start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing - date_box_padding,
+    2 * time_text_w + 3 * date_box_padding, // for some reason 2*time_text_w is not enough
+    time_text_h + 2 * date_box_padding,
+    4,
+    GC9A01A_RED
+  );
+
+  tft.setTextSize(3);
+  tft.setCursor(date_time_ref + distance_from_middle, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing);
+  tft.setTextColor(GC9A01A_WHITE, GC9A01A_RED);
+  tft.print("DD");
+
+  tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+  tft.setCursor(date_time_ref + distance_from_middle + 2*time_text_w + 15, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing);
+  tft.print("MON");
+
+  char messageBuffer[16];
   while (1) {
+    tft.setTextSize(2);
+    tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+
+    // if a message is available, update message
+    if(xQueueReceive(readMessageMQTTQueue, messageBuffer, 0) == pdTRUE) {
+      // display in message box
+      tft.setCursor(message_start_x + 16 + msg_icon_r_margin + message_box_padding, start_y + 32 + y_spacing + 32 + y_spacing_box + 4);
+      tft.print("               "); // clear previous message
+      tft.setCursor(message_start_x + 16 + msg_icon_r_margin + message_box_padding, start_y + 32 + y_spacing + 32 + y_spacing_box + 4);
+      tft.print(messageBuffer);
+    }
+
     // update values based on sensor data
     // round bpm value
     int bpm = (int)roundf(lastBPMValue);
@@ -726,11 +824,11 @@ void updateTFTDisplay(void *pvParameters) {
     int temp = (int)roundf(lastTempValue);
     String temp_str;
     if(temp < 10) {
-      temp_str = String(temp) + "oC ";
+      temp_str = String(temp) + " C ";
     } else if(temp < 100) {
-      temp_str = String(temp) + "oC";
+      temp_str = String(temp) + " C";
     } else {
-      temp_str = "99oC";
+      temp_str = "99 C";
     }
 
     // round spO2 value and add percentage symbol (space pad if single digit)
@@ -759,7 +857,46 @@ void updateTFTDisplay(void *pvParameters) {
     tft.setCursor(start_x_r2 + bpm_width + spacing_r2 + 32 + icon_r_margin, start_y + y_spacing + 32 + 8);
     tft.print(spo2_str);
 
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Update display every second
+    // update time
+    // use time info
+    char hh_str[3];
+    char mm_str[3];
+    char dd_str[3];
+    char mmm_str[4];
+    char day_str[10];
+    char padded_day_str[10];
+
+    sprintf(hh_str, "%02d", timeInfo.tm_hour);
+    sprintf(mm_str, "%02d", timeInfo.tm_min);
+    sprintf(dd_str, "%02d", timeInfo.tm_mday);
+    strftime(mmm_str, 4, "%b", &timeInfo);
+    strftime(day_str, 10, "%A", &timeInfo);
+    sprintf(padded_day_str, "%-9s", day_str);
+
+    // update time
+    tft.setTextSize(3);
+    tft.setCursor(date_time_ref - distance_from_middle - time_text_w*2, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing);
+    tft.print(hh_str);
+    tft.setCursor(date_time_ref - distance_from_middle - time_text_w*2, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing + time_text_h + 4);
+    tft.print(mm_str);
+
+    // update day
+    tft.setTextSize(2);
+    tft.setCursor(date_time_ref + distance_from_middle, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing + time_text_h + 4 + date_box_padding);
+    tft.print(padded_day_str);
+
+    // update date
+    tft.setTextSize(3);
+    tft.setCursor(date_time_ref + distance_from_middle, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing);
+    tft.setTextColor(GC9A01A_WHITE, GC9A01A_RED);
+    tft.print(dd_str);
+
+    // update month
+    tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+    tft.setCursor(date_time_ref + distance_from_middle + 2*time_text_w + 15, start_y + 32 + y_spacing + 32 + y_spacing_box + message_box_padding + 16 + time_y_spacing);
+    tft.print(mmm_str);
+
+    vTaskDelay(pdMS_TO_TICKS(500)); // Update display every 0.5 seconds
   }
 }
 
@@ -838,10 +975,25 @@ void publishSensorData(const sensorData_t &data) {
 
 // MQTT Callback
 void MQTTcallback(char* topic, byte* payload, unsigned int length) {
-  // Messages will only be in form of a string
+  // Messages will only be in form of a string and will be at most 15 characters long
   lastMessage = "";
-  for(int i = 0; i < length; i++) {
+  for(int i = 0; i < length && i < 15; i++) {
     lastMessage += (char)payload[i];
+  }
+
+  // Send message to readMessageMQTT queue
+  xQueueSend(readMessageMQTTQueue, lastMessage.c_str(), 0);
+
+  // Sound buzzer
+  if(xSemaphoreTake(buzzerSemaphore, 0) == pdTRUE) {
+    // Tone buzzer
+    tone(BUZZER_POSITIVE, 1500);
+    delay(200);
+    noTone(BUZZER_POSITIVE);
+    tone(BUZZER_POSITIVE, 440);
+    delay(200);
+    noTone(BUZZER_POSITIVE);
+    xSemaphoreGive(buzzerSemaphore);
   }
 
   // Print message
@@ -880,7 +1032,12 @@ void monitorWiFi(void *pvParameters) {
         #endif
 
         // Sound buzzer for 200ms
-        tone(BUZZER_POSITIVE, 440, 500);
+        if(xSemaphoreTake(buzzerSemaphore, 0) == pdTRUE) {
+          tone(BUZZER_POSITIVE, 100);
+          delay(200);
+          noTone(BUZZER_POSITIVE);
+          xSemaphoreGive(buzzerSemaphore);
+        }
 
         // start AP mode
         wm.setConfigPortalTimeout(AP_MODE_TIMEOUT);
@@ -890,6 +1047,12 @@ void monitorWiFi(void *pvParameters) {
         Serial.printf("SSID: %s\n", wm.getWiFiSSID(true).c_str());
         if(result) {
           Serial.println("Connected to WiFi");
+          // get time
+          if(!getLocalTime(&timeInfo)) {
+            Serial.println("Failed to obtain time after connecting to WiFi");
+          } else {
+            currentTime = mktime(&timeInfo);
+          }
         }
         else {
           Serial.println("Failed to connect to WiFi");
@@ -913,7 +1076,6 @@ void monitorWiFi(void *pvParameters) {
           break;
         }
       }
-
     }
     vTaskDelay(1000/portTICK_PERIOD_MS);
   }
@@ -1028,3 +1190,23 @@ void drawIconFromPROGMEM(int x, int y, const uint32_t* icon_data, int width, int
   }
 }
 
+void updateTime(void *pvParameters) {
+  if (!getLocalTime(&timeInfo)) {
+    Serial.println("Failed to obtain time");
+    currentTime = 0;
+  } else {
+    Serial.println("Time obtained");
+    currentTime = mktime(&timeInfo);
+  }
+
+  while (1) {
+    currentTime++;
+
+    localtime_r(&currentTime, &timeInfo);
+    // Format and print
+    char timeString[32];
+    strftime(timeString, sizeof(timeString), "%H:%M:%S, %A", &timeInfo);
+    Serial.println(timeString);
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
