@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <math.h>
+#include <cmath>
 #include <cstring>
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
@@ -27,6 +28,11 @@
 #include "scaler.h"
 #include "model_data.h"
 #include "mfcc_data.h"
+
+// for tft display
+#include "images/pulse_icon.h"
+#include "images/spo2_icon.h"
+#include "images/temp_icon.h"
 
 // Constants for DSP
 #define SAMPLE_RATE 16000
@@ -90,6 +96,8 @@ void readMLX90614(void *pvParameters);
 void extract_mfcc(const float *audio_signal, float *output_mfcc);
 void scale_mfcc(float* mfcc_buffer, size_t frame_count, size_t n_mfcc);
 
+void drawIconFromPROGMEM(int x, int y, const uint32_t *icon_data, int width, int height);
+
 // Sensor and display objects
 MAX30105 max30102;
 TinyGPSPlus gps;
@@ -99,9 +107,9 @@ Adafruit_GC9A01A tft = Adafruit_GC9A01A(TFT_CS, TFT_DC, TFT_SDA, TFT_SCL, TFT_RS
 
 // Variables for last updated measurement
 sensors_event_t lastAccelValue, lastGyroValue;
-float lastBPMValue = 0.0;
-float lastSpO2Value = 0.0;
-float lastTempValue = 0.0;
+float lastBPMValue = 256.0;
+float lastSpO2Value = 90.0;
+float lastTempValue = 36.0;
 double lastLatValue = 0.0;
 double lastLonValue = 0.0;
 String lastMessage = "";
@@ -274,7 +282,7 @@ void setup() {
   Serial1.begin(9600, SERIAL_8N1, GPS_TX_PIN, GPS_RX_PIN);
 
   // Initialize TFT display
-  tft.begin(40000000); // Set the SPI clock frequency
+  tft.begin(30000000); // Set the SPI clock frequency
   tft.setRotation(1); // Set the display rotation
   tft.fillScreen(GC9A01A_BLACK); // Clear the screen
   tft.setTextSize(2);
@@ -294,16 +302,16 @@ void setup() {
   }
 
   // Create FreeRTOS tasks
-  xTaskCreate(readMPU6050, "Read MPU6050", 4096, NULL, 1, NULL);                // accelerometer and gyroscope
-  xTaskCreate(readMAX30102, "Read MAX30102", 4096, NULL, 1, NULL);              // heart rate and SpO2
-  xTaskCreate(readGPS, "Read GPS", 3072, NULL, 1, NULL);                        // GPS
-  xTaskCreate(updateTFTDisplay, "Update TFT", 4096, NULL, 1, NULL);             // TFT display
-  xTaskCreate(aggregateData, "Aggregate Data", 2048, NULL, 1, NULL);            // aggregate data and send to queue
-  xTaskCreate(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL);   // publish data to MQTT
-  xTaskCreate(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL);                // monitor WiFi
-  xTaskCreate(readINMP441, "Read INMP441", 116700, NULL, 0, NULL);               // read sound sensor
-  // xTaskCreate(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL);           // temperature
-  // xTaskCreate(readButtonTask, "Read Button", 4096, NULL, 1, NULL);           // read button press
+  xTaskCreatePinnedToCore(readMPU6050, "Read MPU6050", 4096, NULL, 1, NULL, 1);                // accelerometer and gyroscope (Core 1)
+  xTaskCreatePinnedToCore(readMAX30102, "Read MAX30102", 4096, NULL, 1, NULL, 1);              // heart rate and SpO2 (Core 1)
+  xTaskCreatePinnedToCore(readGPS, "Read GPS", 3072, NULL, 1, NULL, 1);                        // GPS (Core 1)
+  xTaskCreatePinnedToCore(updateTFTDisplay, "Update TFT", 4096, NULL, 1, NULL, 1);             // TFT display (Core 1)
+  xTaskCreatePinnedToCore(aggregateData, "Aggregate Data", 2048, NULL, 1, NULL, 1);            // aggregate data and send to queue (Core 1)
+  xTaskCreatePinnedToCore(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL, 1);   // publish data to MQTT (Core 1)
+  xTaskCreatePinnedToCore(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL, 0);                // monitor WiFi (Core 0)
+  xTaskCreatePinnedToCore(readINMP441, "Read INMP441", 116700, NULL, 0, NULL, 0);              // read sound sensor (Core 0)
+  // xTaskCreatePinnedToCore(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL, 1);           // temperature (Core 1)
+  // xTaskCreatePinnedToCore(readButtonTask, "Read Button", 4096, NULL, 1, NULL, 1);           // read button press (Core 1)
 }
 
 void loop() {
@@ -323,22 +331,10 @@ void readMPU6050(void *pvParameters) {
   float prevAccelZ = 0.0;
 
   while (1) {
-    // take semaphore
-    // if(xSemaphoreTake(i2cSemaphore, portMAX_DELAY) != pdTRUE) {
-    //   #if DEBUG
-    //   Serial.println("Failed to take I2C semaphore");
-    //   #endif
-    //   vTaskDelay(5 / portTICK_PERIOD_MS);
-    //   continue;
-    // }
-
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
     lastAccelValue = a;
     lastGyroValue = g;
-
-    // release semaphore
-    // xSemaphoreGive(i2cSemaphore);
 
     // convert acceleration to g from m/s^2
     float acceleration_x_mg = a.acceleration.x/9.8;
@@ -391,37 +387,16 @@ void readMAX30102(void *pvParameters) {
   //read the first 100 samples, and determine the signal range
   for (byte i = 0 ; i < bufferLength ; i++)
   {
-    // take semaphore
-    // if(xSemaphoreTake(i2cSemaphore, portMAX_DELAY) != pdTRUE) {
-    //   #if DEBUG
-    //   Serial.println("Failed to take I2C semaphore");
-    //   #endif
-
-    //   // dont skip sample
-    //   i--;
-    //   vTaskDelay(5 / portTICK_PERIOD_MS);
-    //   continue;
-    // }
-
     while (max30102.available() == false) //do we have new data?
       max30102.check(); //Check the sensor for new data
 
     redBuffer[i] = max30102.getRed();
     irBuffer[i] = max30102.getIR();
     max30102.nextSample(); //We're finished with this sample so move to next sample
-
-    // release semaphore
-    // xSemaphoreGive(i2cSemaphore);
-
-    // Serial.print(F("red="));
-    // Serial.print(redBuffer[i], DEC);
-    // Serial.print(F(", ir="));
-    // Serial.println(irBuffer[i], DEC);
   }
 
   //calculate heart rate and SpO2 after first 100 samples (first 4 seconds of samples)
   maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
-  
   
   //Continuously taking samples from MAX30102.  Heart rate and SpO2 are calculated every 1 second
   while (1)
@@ -436,34 +411,12 @@ void readMAX30102(void *pvParameters) {
     //take 25 sets of samples before calculating the heart rate.
     for (byte i = 75; i < 100; i++)
     {
-      // take semaphore
-      // if(xSemaphoreTake(i2cSemaphore, portMAX_DELAY) != pdTRUE) {
-      //   #if DEBUG
-      //   Serial.println("Failed to take I2C semaphore");
-      //   #endif
-
-      //   // dont skip sample
-      //   i--;
-      //   vTaskDelay(5 / portTICK_PERIOD_MS);
-      //   continue;
-      // }
-
       while (max30102.available() == false) //do we have new data?
         max30102.check(); //Check the sensor for new data
 
       redBuffer[i] = max30102.getRed();
       irBuffer[i] = max30102.getIR();
       max30102.nextSample(); //We're finished with this sample so move to next sample
-
-      // release semaphore
-      // xSemaphoreGive(i2cSemaphore);
-      // vTaskDelay(5 / portTICK_PERIOD_MS);
-
-      //send samples and calculation result to terminal program through UART
-      // Serial.print(F("red="));
-      // Serial.print(redBuffer[i], DEC);
-      // Serial.print(F(", ir="));
-      // Serial.print(irBuffer[i], DEC);
     }
 
     //After gathering 25 new samples recalculate HR and SP02
@@ -534,7 +487,6 @@ void readINMP441(void *pvParameters) {
   // for debugging inference latency
   unsigned long inference_start_time;
   #endif
-
 
   // read audio data at 16kHz
   // setup I2S
@@ -643,21 +595,15 @@ void readINMP441(void *pvParameters) {
 
   float mfcc_buffer[FRAME_COUNT * N_MFCC];
 
-
   while(1) {
     // read 1 second of audio data
     for(int i = 0; i < SAMPLE_RATE; i++) {
       // i2s_read(I2S_NUM_0, &audioData[i], sizeof(float), &bytesRead, portMAX_DELAY);
+      
       // audioData[i] = 1.0; // all ones
 
       audioData[i] = 0.5 * sin(2 * PI * 1000 * i / SAMPLE_RATE); // sine wave of 1kHz
     }
-
-    // for(int i = 0; i < SAMPLE_RATE; i++) {
-    //   Serial.println(audioData[i]);
-    // }
-
-    // starting time
 
     #if DEBUG
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
@@ -666,14 +612,13 @@ void readINMP441(void *pvParameters) {
     inference_start_time = millis();
     #endif
 
-
     // extract MFCC features (32 frames, 40 coefficients)
     extract_mfcc(audioData, mfcc_buffer);
 
     // scale MFCC features
     scale_mfcc(mfcc_buffer, FRAME_COUNT, N_MFCC);
 
-    // print scald mfcc
+    // print scaled mfcc
     // for(int i = 0; i < FRAME_COUNT; i++) {
     //   Serial.println("Frame " + String(i));
     //   for(int j = 0; j < N_MFCC; j++) {
@@ -710,17 +655,110 @@ void readINMP441(void *pvParameters) {
 }
 
 void updateTFTDisplay(void *pvParameters) {
+  // clear
+  tft.fillScreen(GC9A01A_BLACK);
+  tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+  tft.setTextSize(1); // default is 6x8, 2 is 12x16, 3 is 18x24, etc.
+
+  #if DEBUG
+  // draw middle lines
+  tft.drawLine(0, 120, 240, 120, GC9A01A_WHITE);
+  tft.drawLine(120, 0, 120, 240, GC9A01A_WHITE);
+  #endif
+
+  const int tft_width = 240;      // TFT display width
+  const int text_width = 12;      // Width of text (in pixels)
+  const int spacing_r2 = 25;      // Space between metrics
+  const int icon_r_margin = 6;    // Right margin for icons
+  const int start_y = 16;         // Starting y position for row 1
+  const int y_spacing = 20;       // Y spacing between rows
+
+  // Metric widths: Icon Width + Icon Right Margin + Text Width
+  const int bpm_width = 32 + (3 * text_width) + icon_r_margin;
+  const int temp_width = 32 + (4 * text_width) + icon_r_margin;  
+  const int spo2_width = 32 + (4 * text_width) + icon_r_margin; 
+
+  // Total width of metrics and spacing_r2
+  int total_width_r2 = bpm_width + spo2_width + (1 * spacing_r2);
+
+  // Calculate starting x position for centering
+  int start_x_r2 = (tft_width - total_width_r2) / 2;
+  int start_x_r1 = (tft_width - temp_width) / 2;
+
+  // draw temperature icon (row 1)
+  drawIconFromPROGMEM(start_x_r1, start_y, temp_icon, 32, 32);
+  tft.setCursor(start_x_r1 + (32 - 6*4)/2, start_y + 32 + 4);
+  tft.print("TEMP");
+
+  // draw pulse icon (row 2)
+  drawIconFromPROGMEM(start_x_r2, start_y + y_spacing + 32, pulse_icon, 32, 32);
+  tft.setCursor(start_x_r2 + (32 - 6*3)/2, start_y + y_spacing + 32 + 32 + 4);
+  tft.print("BPM");
+    
+  // draw spo2 icon (row 2)
+  drawIconFromPROGMEM(start_x_r2 + bpm_width + spacing_r2 , start_y + y_spacing + 32, spo2_icon, 32, 32);
+  tft.setCursor(start_x_r2 + bpm_width + spacing_r2 + (32 - 6*4)/2, start_y + y_spacing + 32 + 32 + 4);
+  tft.print("SPO2");
+  
+  tft.setTextSize(2);
+
+  const int y_spacing_box = 40;   // Y spacing between message box and metrics 
+  int message_start_x = (tft_width - 15 * text_width) / 2;
+
+  // message box
+  tft.setCursor(message_start_x, start_y + 32 + y_spacing + 32 + y_spacing_box);
+  tft.print("this_is_a_msg_1"); // 15 characters
+  tft.drawRect(
+    message_start_x, 
+    start_y + 32 + y_spacing + 32 + y_spacing_box, 
+    15 * text_width, 
+    16, 
+    GC9A01A_WHITE);
+
   while (1) {
-    tft.fillScreen(GC9A01A_BLACK); // Clear the display
-    tft.setCursor(0, 20);
-    tft.print("BPM: ");
-    tft.print(lastBPMValue);
-    tft.setCursor(0, 40);
-    tft.print("SpO2: ");
-    tft.print(lastSpO2Value);
-    tft.setCursor(0, 60);
-    tft.print("X: ");
-    tft.print(lastAccelValue.acceleration.x);
+    // update values based on sensor data
+    // round bpm value
+    int bpm = (int)roundf(lastBPMValue);
+    char bpm_str[4];
+    sprintf(bpm_str, "%-3d", bpm); // space pad if single/double digit
+
+    // round temp and add degree symbol
+    int temp = (int)roundf(lastTempValue);
+    String temp_str;
+    if(temp < 10) {
+      temp_str = String(temp) + "oC ";
+    } else if(temp < 100) {
+      temp_str = String(temp) + "oC";
+    } else {
+      temp_str = "99oC";
+    }
+
+    // round spO2 value and add percentage symbol (space pad if single digit)
+    int spo2 = (int)roundf(lastSpO2Value);
+    String spo2_str;
+
+    if(spo2 < 10) { // single digit
+      spo2_str = String(spo2) + "%  ";
+    }
+    else if(spo2 >= 10 && spo2 < 100) { // 2 digit
+      spo2_str = String(spo2) + "% ";
+    }
+    else { // 3 digit
+      spo2_str = "100%";
+    }
+
+    // temp
+    tft.setCursor(start_x_r1 + 32 + icon_r_margin, start_y + 8);
+    tft.print(temp_str);
+
+    // bpm
+    tft.setCursor(start_x_r2 + 32 + icon_r_margin, start_y + y_spacing + 32 + 8);
+    tft.print(bpm_str);
+
+    // spo2
+    tft.setCursor(start_x_r2 + bpm_width + spacing_r2 + 32 + icon_r_margin, start_y + y_spacing + 32 + 8);
+    tft.print(spo2_str);
+
     vTaskDelay(pdMS_TO_TICKS(1000)); // Update display every second
   }
 }
@@ -891,17 +929,7 @@ void hann_window(float *window, int size) {
 
 // Perform FFT and calculate power spectrum
 void compute_power_spectrum(const float *frame, float *power_spectrum, int size) {
-    // kiss_fft_cfg cfg = kiss_fft_alloc(size, 0, NULL, NULL);
-    // if(cfg == NULL) {
-    //     #if DEBUG
-    //     Serial.println("Failed to allocate kiss_fft_cfg");
-    //     #endif
-    //     while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
-    // }
-
     kiss_fft_cpx in[N_FFT], out[N_FFT];
-    // kiss_fft_cpx* in = (kiss_fft_cpx*) heap_caps_malloc(size * sizeof(kiss_fft_cpx), MALLOC_CAP_SPIRAM);
-    // kiss_fft_cpx* out = (kiss_fft_cpx*) heap_caps_malloc(size * sizeof(kiss_fft_cpx), MALLOC_CAP_SPIRAM);
 
     for (int i = 0; i < size; i++) {
         in[i].r = frame[i];
@@ -913,8 +941,6 @@ void compute_power_spectrum(const float *frame, float *power_spectrum, int size)
     for (int i = 0; i <= size / 2; i++) {
         power_spectrum[i] = (out[i].r * out[i].r) + (out[i].i * out[i].i);
     }
-
-    // free(cfg);
 }
 
 // Apply Mel filterbank
@@ -977,3 +1003,28 @@ void scale_mfcc(float* mfcc_buffer, size_t frame_count, size_t n_mfcc) {
         mfcc_buffer[i] = (mfcc_buffer[i] - scaler_mean_PSRAM[i]) / scaler_std_PSRAM[i];
     }
 }
+
+// Function to draw an icon from PROGMEM
+void drawIconFromPROGMEM(int x, int y, const uint32_t* icon_data, int width, int height) {
+  for (int row = 0; row < height; row++) {
+    for (int col = 0; col < width; col++) {
+      // Calculate the index of the color in the PROGMEM array
+      int index = row * width + col;
+
+      // Read the color value from PROGMEM
+      uint32_t color = pgm_read_dword(&icon_data[index]);
+
+      // Extract RGB components from 0xRRGGBB
+      uint8_t red = (color >> 16) & 0xFF;
+      uint8_t green = (color >> 8) & 0xFF;
+      uint8_t blue = color & 0xFF;
+
+      // Convert RGB888 to RGB565
+      uint16_t color565 = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3);
+
+      // Draw the pixel
+      tft.drawPixel(x + col, y + row, color565);
+    }
+  }
+}
+
