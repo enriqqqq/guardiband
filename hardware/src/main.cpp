@@ -319,10 +319,10 @@ void setup() {
   }
 
   // Initialize MLX90614
-  // if(!mlx.begin()) {
-  //   Serial.println("Failed to find MLX90614 chip");
-  //   while (1) {vTaskDelay(10/portTICK_PERIOD_MS);}
-  // }
+  if(!mlx.begin()) {
+    Serial.println("Failed to find MLX90614 chip");
+    while (1) {vTaskDelay(10/portTICK_PERIOD_MS);}
+  }
 
   // Initialize MAX30102
   if(!max30102.begin()) {
@@ -365,7 +365,7 @@ void setup() {
   xTaskCreatePinnedToCore(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL, 0);                // monitor WiFi (Core 0)
   xTaskCreatePinnedToCore(readINMP441, "Read INMP441", 116700, NULL, 0, NULL, 0);              // read sound sensor (Core 0)
   xTaskCreatePinnedToCore(updateTime, "Update Time", 2048, NULL, 0, NULL, 0);                  // update time (Core 0)
-  // xTaskCreatePinnedToCore(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL, 1);           // temperature (Core 1)
+  xTaskCreatePinnedToCore(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL, 1);              // temperature (Core 1)
   // xTaskCreatePinnedToCore(readButtonTask, "Read Button", 4096, NULL, 1, NULL, 1);           // read button press (Core 1)
 }
 
@@ -709,6 +709,8 @@ void readINMP441(void *pvParameters) {
       #if DEBUG
       Serial.println("Cough detected!");
       #endif
+      String payload = "{\"type\":\"alert\", \"message\":\"Cough Detected\"}";
+      mqttClient.publish(MQTT_PUBLISH_TOPIC, payload.c_str());
     }
 
     vTaskDelay(pdMS_TO_TICKS(100)); // Delay 100ms
