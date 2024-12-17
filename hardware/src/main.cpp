@@ -24,6 +24,7 @@
 #include <tensorflow/lite/micro/micro_error_reporter.h>
 #include <tensorflow/lite/schema/schema_generated.h>
 #include <kiss_fft.h>
+#include <ArduinoOTA.h>
 
 #include "scaler.h"
 #include "model_data.h"
@@ -34,6 +35,8 @@
 #include "images/spo2_icon.h"
 #include "images/temp_icon.h"
 #include "images/message_icon.h"
+#include "images/no_wifi_icon.h"
+#include "images/wifi_icon.h"
 
 // Constants for DSP
 #define SAMPLE_RATE 16000
@@ -90,7 +93,6 @@ void readMPU6050(void *pvParameters);
 void readMAX30102(void *pvParameters);
 void readGPS(void *pvParameters);
 void readMLX90614(void *pvParameters);
-void readINMP441(void *pvParameters);
 void updateTFTDisplay(void *pvParameters);
 void aggregateData(void *pvParameters);
 void publishMQTTDataTask(void *pvParameters);
@@ -316,6 +318,7 @@ void setup() {
   // Initialize MPU6050
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
+    while (1) {vTaskDelay(10/portTICK_PERIOD_MS);}
   }
 
   // Initialize MLX90614
@@ -352,8 +355,13 @@ void setup() {
   // Create Buzzer semaphore mutex
   buzzerSemaphore = xSemaphoreCreateMutex();
 
-  // Set up WiFiManager
+  // Set up NTP time
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+  // Setup OTA
+  ArduinoOTA.setHostname("Guardiband");
+  ArduinoOTA.setPassword("guardiband-1A");
+  ArduinoOTA.begin();
 
   // Create FreeRTOS tasks
   xTaskCreatePinnedToCore(readMPU6050, "Read MPU6050", 4096, NULL, 1, NULL, 1);                // accelerometer and gyroscope (Core 1)
@@ -364,23 +372,25 @@ void setup() {
   xTaskCreatePinnedToCore(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL, 1);   // publish data to MQTT (Core 1)
   xTaskCreatePinnedToCore(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL, 0);                // monitor WiFi (Core 0)
   xTaskCreatePinnedToCore(readINMP441, "Read INMP441", 116700, NULL, 0, NULL, 0);              // read sound sensor (Core 0)
-  xTaskCreatePinnedToCore(updateTime, "Update Time", 2048, NULL, 0, NULL, 0);                  // update time (Core 0)
+  xTaskCreatePinnedToCore(updateTime, "Update Time", 2048, NULL, 1, NULL, 1);                  // update time (Core 1)
   xTaskCreatePinnedToCore(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL, 1);              // temperature (Core 1)
   // xTaskCreatePinnedToCore(readButtonTask, "Read Button", 4096, NULL, 1, NULL, 1);           // read button press (Core 1)
 }
 
 void loop() {
   // print out currently available RAM
-  #if DEBUG
-  Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
-  #endif
-  delay(1000);
+  // #if DEBUG
+  // Serial.printf("Free heap: %d\n", ESP.getFreeHeap());
+  // #endif
+  // delay(1000);
+
+  ArduinoOTA.handle();
 }
 
 // Task definitions
 void readMPU6050(void *pvParameters) {
-  const float MPU6050_SAMPLE_INTERVAL = 500;
-  const float fallThreshold = 20.0;
+  const float MPU6050_SAMPLE_INTERVAL = 100;
+  const float fallThreshold = 14.0;
   float prevAccelX = 0.0;
   float prevAccelY = 0.0;
   float prevAccelZ = 0.0;
@@ -414,14 +424,14 @@ void readMPU6050(void *pvParameters) {
       #if DEBUG
       Serial.println("Fall detected");
       #endif
-      String payload = "{\"type\":\"alert\", \"message\":\"SpO2 too low\"}";
+      String payload = "{\"type\":\"alert\", \"message\":\"Fall Detected\"}";
       mqttClient.publish(MQTT_PUBLISH_TOPIC, payload.c_str());
     }
 
     // print sensor data
     #if DEBUG
-    Serial.printf("MPU6050 - Acceleration: X: %.2f Y: %.2f Z: %.2f\n", a.acceleration.x, a.acceleration.y, a.acceleration.z);
-    Serial.printf("MPU6050 - Jerk Magnitude: %.2f\n", jerkMagnitude);
+    // Serial.printf("MPU6050 - Acceleration: X: %.2f Y: %.2f Z: %.2f\n", a.acceleration.x, a.acceleration.y, a.acceleration.z);
+    // Serial.printf("MPU6050 - Jerk Magnitude: %.2f\n", jerkMagnitude);
     #endif
 
     vTaskDelay(MPU6050_SAMPLE_INTERVAL / portTICK_PERIOD_MS);
@@ -556,7 +566,7 @@ void readINMP441(void *pvParameters) {
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
     .dma_buf_len = 64
@@ -576,24 +586,6 @@ void readINMP441(void *pvParameters) {
   Serial.println("INMP441 - I2S setup complete");
   #endif
   
-  // 1 second buffer 
-  // float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
-  float audioData[SAMPLE_RATE];
-  size_t bytesRead;
-
-  if(!audioData) {
-    #if DEBUG
-    Serial.println("Failed to allocate memory for audio data");
-    #endif
-    while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
-  }
-
-  #if DEBUG
-  Serial.println("Allocated memory for audio data");
-  Serial.println("PSRAM free: " + String(ESP.getFreePsram()));
-  Serial.println("Heap free: " + String(ESP.getFreeHeap()));
-  #endif
-
   // Create an error reporter
   tflite::MicroErrorReporter micro_error_reporter;
   tflite::ErrorReporter* error_reporter = &micro_error_reporter;
@@ -652,18 +644,52 @@ void readINMP441(void *pvParameters) {
   int n_frame = input->dims->data[1];
   int n_mfcc = input->dims->data[2];
   int channels = input->dims->data[3];
-   printf("Model expects input shape: [%d, %d, %d, %d]\n", batch_size, n_frame, n_mfcc, channels);
+  printf("Model expects input shape: [%d, %d, %d, %d]\n", batch_size, n_frame, n_mfcc, channels);
 
   float mfcc_buffer[FRAME_COUNT * N_MFCC];
 
+  // 1 second buffer 
+  // float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
+  float audioData[SAMPLE_RATE];
+  size_t bytesRead;
+
+  if(!audioData) {
+    #if DEBUG
+    Serial.println("Failed to allocate memory for audio data");
+    #endif
+    while(1){vTaskDelay(10/portTICK_PERIOD_MS);}
+  }
+
+  #if DEBUG
+  Serial.println("Allocated memory for audio data");
+  Serial.println("PSRAM free: " + String(ESP.getFreePsram()));
+  Serial.println("Heap free: " + String(ESP.getFreeHeap()));
+  #endif
+  
+  #define GAIN 4.0f
+
   while(1) {
     // read 1 second of audio data
-    for(int i = 0; i < SAMPLE_RATE; i++) {
-      // i2s_read(I2S_NUM_0, &audioData[i], sizeof(float), &bytesRead, portMAX_DELAY);
-      
-      // audioData[i] = 1.0; // all ones
+    for (int i = 0; i < SAMPLE_RATE; i++) {
+        int32_t sample;
+        float scaled_sample;
+        float amplified_sample;
+        i2s_read(I2S_NUM_0, &sample, sizeof(int32_t), &bytesRead, portMAX_DELAY);  // Pass the address of sample
+        scaled_sample = (float)sample / (float)INT32_MAX;
+        amplified_sample = scaled_sample * GAIN;
 
-      audioData[i] = 0.5 * sin(2 * PI * 1000 * i / SAMPLE_RATE); // sine wave of 1kHz
+        // prevent clipping
+        if (amplified_sample > 1.0f) amplified_sample = 1.0f;
+        if (amplified_sample < -1.0f) amplified_sample = -1.0f;
+
+        audioData[i] = amplified_sample;
+
+        #if DEBUG
+        // Serial.printf("Byte read: %d\n", bytesRead);
+        // Serial.printf("%.6f\n", scaled_sample);
+        // Serial.printf("%.6f\n", amplified_sample);
+        // Serial.printf("%ld\n", sample);
+        #endif
     }
 
     #if DEBUG
@@ -679,16 +705,6 @@ void readINMP441(void *pvParameters) {
     // scale MFCC features
     scale_mfcc(mfcc_buffer, FRAME_COUNT, N_MFCC);
 
-    // print scaled mfcc
-    // for(int i = 0; i < FRAME_COUNT; i++) {
-    //   Serial.println("Frame " + String(i));
-    //   for(int j = 0; j < N_MFCC; j++) {
-    //     Serial.print(mfcc_buffer[i * N_MFCC + j]);
-    //     Serial.print(" ");
-    //   }
-    //   Serial.println();
-    // }
-    
     // copy scaled MFCC features to input tensor
     memcpy(input->data.f, mfcc_buffer, FRAME_COUNT * N_MFCC * sizeof(float));
 
@@ -705,7 +721,7 @@ void readINMP441(void *pvParameters) {
     Serial.println("INMP441 - Inference latency: " + String(millis() - inference_start_time) + "ms");
     Serial.printf("INMP441 - Output value: %.6f\n", output_value);
     #endif
-    if(output_value > 0.9) {
+    if(output_value > 0.5) {
       #if DEBUG
       Serial.println("Cough detected!");
       #endif
@@ -803,9 +819,31 @@ void updateTFTDisplay(void *pvParameters) {
   tft.print("MON");
 
   char messageBuffer[16];
+  wl_status_t wifiConnectedState = WiFi.status();
+
+  const int wifi_icon_x = (tft_width - 16)/2;
+  const int wifi_icon_y = 215;
+
+  // draw wifi icon
+  if(wifiConnectedState == WL_CONNECTED) {
+    drawIconFromPROGMEM(wifi_icon_x, wifi_icon_y, wifi_signal, 16, 16);
+  } else {
+    drawIconFromPROGMEM(wifi_icon_x, wifi_icon_y, no_wifi, 16, 16);
+  }
+
   while (1) {
     tft.setTextSize(2);
     tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
+
+    // change icon on wifi state change
+    if(wifiConnectedState != WiFi.status()) {
+      wifiConnectedState = WiFi.status();
+      if(wifiConnectedState == WL_CONNECTED) {
+        drawIconFromPROGMEM(wifi_icon_x, wifi_icon_y, wifi_signal, 16, 16);
+      } else {
+        drawIconFromPROGMEM(wifi_icon_x, wifi_icon_y, no_wifi, 16, 16);
+      }
+    }
 
     // if a message is available, update message
     if(xQueueReceive(readMessageMQTTQueue, messageBuffer, 0) == pdTRUE) {
@@ -1193,22 +1231,46 @@ void drawIconFromPROGMEM(int x, int y, const uint32_t* icon_data, int width, int
 }
 
 void updateTime(void *pvParameters) {
-  if (!getLocalTime(&timeInfo)) {
-    Serial.println("Failed to obtain time");
-    currentTime = 0;
-  } else {
-    Serial.println("Time obtained");
-    currentTime = mktime(&timeInfo);
-  }
+  bool timeObtained = false;
+  int refreshCounter = 0;
 
   while (1) {
-    currentTime++;
+    // Refresh time from NTP based on the condition
+    if (refreshCounter == 0) {
+      Serial.println("Getting time...");
+      if (getLocalTime(&timeInfo)) {
+        Serial.println("Time obtained");
+        currentTime = mktime(&timeInfo);  // Update currentTime
+        timeObtained = true;
+      } else {
+        Serial.println("Failed to obtain time");
+        timeObtained = false;
+      }
+    }
 
-    localtime_r(&currentTime, &timeInfo);
-    // Format and print
-    char timeString[32];
-    strftime(timeString, sizeof(timeString), "%H:%M:%S, %A", &timeInfo);
-    Serial.println(timeString);
+    // Print time only if NTP was successful at least once
+    if (timeObtained) {
+      localtime_r(&currentTime, &timeInfo);
+
+      // Format and print
+      char timeString[32];
+      strftime(timeString, sizeof(timeString), "%H:%M:%S, %A", &timeInfo);
+      Serial.println(timeString);
+    } else {
+      Serial.println("Waiting for time...");
+    }
+
+    // Increment time and refresh counter
+    currentTime++;
+    refreshCounter++;
+
+    // NTP refresh intervals
+    if (timeObtained && refreshCounter >= 1800) {  // Refresh every 30 minute
+      refreshCounter = 0;
+    } else if (!timeObtained && refreshCounter >= 5) {  // Retry every 5 second
+      refreshCounter = 0;
+    }
+
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }

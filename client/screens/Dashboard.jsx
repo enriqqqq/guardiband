@@ -1,10 +1,9 @@
-import { View, Text, Button, Modal, TextInput, Alert } from 'react-native';
+import { View, Text, Button, Modal, Alert, TextInput } from 'react-native';
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import openMap from 'react-native-open-maps';
 import Icon from 'react-native-vector-icons/FontAwesome';
 import Paho from 'paho-mqtt';
 import { useState, useEffect, useRef } from 'react';
-import PingForm from '../components/PingForm';
 
 const Dashboard = () => {
     const [mqttData, setMqttData] = useState([
@@ -13,7 +12,8 @@ const Dashboard = () => {
             spo2: "0",
             heartRate: "0",
             lat: "-6.2013465",
-            lon: "106.7814731"
+            lon: "106.7814731",
+            firstReadGPS: false
         }
     ]);
 
@@ -31,7 +31,10 @@ const Dashboard = () => {
     useEffect(() => {
         console.log('useEffect for MQTT connection');
         // use 'test.mosquitto.org' as a test broker
-        const client = new Paho.Client('test.mosquitto.org', 8080, 'clientId');
+        // const client = new Paho.Client('test.mosquitto.org', 8080, '1A-guardian');
+        // const client = new Paho.Client('broker.hivemq.com', 8884, '1A-guardian');
+        const client = new Paho.Client('broker.emqx.io', 8083, '1A-guardian');
+
         client.onConnectionLost = (responseObject) => {
             console.log('Connection lost:', responseObject.errorMessage);
         };
@@ -64,6 +67,12 @@ const Dashboard = () => {
                         const distance = Math.sqrt(Math.pow(newCoord.latitude - lastCoord.latitude, 2) + Math.pow(newCoord.longitude - lastCoord.longitude, 2));
                         console.log('Distance:', distance);
                         console.log('Last coord:', lastCoord);
+                        
+                        // if firstReadGPS is false don't add new coordinate
+                        if(!payload.firstReadGPS) {
+                            return prevCoords;
+                        }
+
 
                         // if the distance is more than 5m, add the new coordinate
                         if(distance > 0.00005) {
@@ -155,6 +164,7 @@ const Dashboard = () => {
                     <View className="flex-1">
 
                         <MapView
+                            key={1}
                             onMapReady={() => setMapReady(true)}
                             initialRegion={{
                                 latitude: -6.2013465,
@@ -205,6 +215,55 @@ const Dashboard = () => {
             </View>
         </View>
     );
+}
+
+const PingForm = ({ mqttClient, handleClose }) => {
+    // give form to send mqtt message
+    const [pingValue, setPingValue] = useState('Ping');
+
+    const sendMessage = () => {
+        if(mqttClient && mqttClient.isConnected()) {
+            const message = new Paho.Message(pingValue);
+            message.destinationName = 'guardiband/1A/message';
+            console.log('Sending message:', message);
+            mqttClient.send(message);
+            handleClose();
+        }
+    }
+
+    const handlePingValueChange = (value) => {
+        // limit to 15 characters
+        if (value.length <= 15) {
+            setPingValue(value);
+        }
+    }
+
+    return (
+        <>
+            <View className="absolute bg-black opacity-50 w-full h-full"></View>
+            <View className="flex-1 justify-center items-center">
+                <View className="bg-white p-5 rounded">
+                    <Text className="text-xl font-bold">Send a message</Text>
+                    <View className="mt-1 mb-3">
+                        <Text>Message</Text>
+                        <TextInput className="bg-white border rounded p-2" value={pingValue} onChangeText={handlePingValueChange}></TextInput>
+                        <Text className="text-xs">{pingValue.length}/15</Text>
+                    </View>
+                    <View className="gap-1">
+                        <Button
+                            title="Send"
+                            onPress={sendMessage}
+                        ></Button>
+                        <Button
+                            title="Close"
+                            onPress={handleClose}
+                            color={'red'}
+                        ></Button>
+                    </View>
+                </View>
+            </View>
+        </>
+    )
 }
 
 export default Dashboard;
