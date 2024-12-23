@@ -15,6 +15,7 @@
 #include <TinyGPSPlus.h>
 #include <FreeRTOS.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <driver/i2s.h>
 #include <WiFiManager.h>
@@ -29,6 +30,8 @@
 #include "scaler.h"
 #include "model_data.h"
 #include "mfcc_data.h"
+
+#include "ca_cert.h"
 
 // for tft display
 #include "images/pulse_icon.h"
@@ -136,10 +139,15 @@ SemaphoreHandle_t buzzerSemaphore;
 // WiFi Setup & MQTT
 WiFiManager wm;
 // const char* mqtt_server = "broker.hivemq.com";
-const char* mqtt_server = "broker.emqx.io";
+// const char* mqtt_server = "broker.emqx.io";
 unsigned long start_time = 0;
 
-WiFiClient espClient;
+const char* mqtt_server = "id1f113f.ala.asia-southeast1.emqxsl.com";
+const int mqtt_port = 8883; // MQTT over TLS/SSL Port
+const char* mqtt_username = "-";
+const char* mqtt_password = "-";
+
+WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
 // first read flag
@@ -157,25 +165,6 @@ kiss_fft_cfg kissfft_cfg;
 
 // variable for tft display
 const int tft_width = 240;      // TFT display width
-const int text_width = 12;      // Width of text (in pixels)
-const int spacing_r2 = 25;      // Space between metrics
-const int icon_r_margin = 6;    // Right margin for icons
-const int start_y = 16;         // Starting y position for row 1
-const int y_spacing = 20;       // Y spacing between rows
-// Metric widths: Icon Width + Icon Right Margin + Text Width
-const int bpm_width = 32 + (3 * text_width) + icon_r_margin;
-const int temp_width = 32 + (4 * text_width) + icon_r_margin;  
-const int spo2_width = 32 + (4 * text_width) + icon_r_margin; 
-// Total width of metrics and spacing_r2
-int total_width_r2 = bpm_width + spo2_width + (1 * spacing_r2);
-// Calculate starting x position for centering
-int start_x_r2 = (tft_width - total_width_r2) / 2;
-int start_x_r1 = (tft_width - temp_width) / 2;
-const int y_spacing_box = 25;   // Y spacing between message box and metrics 
-const int message_box_padding = 4; // Padding for message box
-const int msg_icon_r_margin = 8; // Right margin for message icon
-int message_row_width = 15 * text_width + 2 * message_box_padding + 16 + msg_icon_r_margin; // 15 characters + x padding + icon width + icon right margin
-int message_start_x = (tft_width - message_row_width) / 2;
 
 // Config Time
 const char* ntpServer = "pool.ntp.org";
@@ -198,7 +187,7 @@ void setup() {
   
   // Initialize TFT display
   tft.begin(30000000); // Set the SPI clock frequency
-  tft.setRotation(1); // Set the display rotation
+  tft.setRotation(3); // Set the display rotation
   tft.fillScreen(GC9A01A_BLACK); // Clear the screen
   tft.setTextSize(3);
   tft.setTextColor(GC9A01A_BLACK);
@@ -278,6 +267,9 @@ void setup() {
   // Initialize I2C for MPU6050 and MAX30102
   Wire.begin(I2C_SDA, I2C_SCL);
 
+  // set certificate for secure connection
+  espClient.setCACert(ca_cert);
+
   // Initialize WiFi
   WiFi.mode(WIFI_STA);
   WiFi.begin(wm.getWiFiSSID(), wm.getWiFiPass());
@@ -312,7 +304,7 @@ void setup() {
   #endif
 
   // Set up MQTT
-  mqttClient.setServer(mqtt_server, 1883);
+  mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(MQTTcallback);
 
   // Initialize MPU6050
@@ -371,7 +363,7 @@ void setup() {
   xTaskCreatePinnedToCore(aggregateData, "Aggregate Data", 2048, NULL, 1, NULL, 1);            // aggregate data and send to queue (Core 1)
   xTaskCreatePinnedToCore(publishMQTTDataTask, "Publish MQTT Data", 4096, NULL, 1, NULL, 1);   // publish data to MQTT (Core 1)
   xTaskCreatePinnedToCore(monitorWiFi, "Monitor WiFi", 8192, NULL, 0, NULL, 0);                // monitor WiFi (Core 0)
-  xTaskCreatePinnedToCore(readINMP441, "Read INMP441", 116700, NULL, 0, NULL, 0);              // read sound sensor (Core 0)
+  xTaskCreatePinnedToCore(readINMP441, "Read INMP441", 60000, NULL, 0, NULL, 0);              // read sound sensor (Core 0)
   xTaskCreatePinnedToCore(updateTime, "Update Time", 2048, NULL, 1, NULL, 1);                  // update time (Core 1)
   xTaskCreatePinnedToCore(readMLX90614, "Read MLX90614", 4096, NULL, 1, NULL, 1);              // temperature (Core 1)
   // xTaskCreatePinnedToCore(readButtonTask, "Read Button", 4096, NULL, 1, NULL, 1);           // read button press (Core 1)
@@ -455,7 +447,7 @@ void readMAX30102(void *pvParameters) {
   for (byte i = 0 ; i < bufferLength ; i++)
   {
     while (max30102.available() == false) //do we have new data?
-      max30102.check(); //Check the sensor for new data
+    max30102.check(); //Check the sensor for new data
 
     redBuffer[i] = max30102.getRed();
     irBuffer[i] = max30102.getIR();
@@ -649,8 +641,8 @@ void readINMP441(void *pvParameters) {
   float mfcc_buffer[FRAME_COUNT * N_MFCC];
 
   // 1 second buffer 
-  // float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
-  float audioData[SAMPLE_RATE];
+  float* audioData = (float*) heap_caps_malloc(SAMPLE_RATE * sizeof(float), MALLOC_CAP_SPIRAM);
+  // float audioData[SAMPLE_RATE];
   size_t bytesRead;
 
   if(!audioData) {
@@ -735,6 +727,25 @@ void readINMP441(void *pvParameters) {
 
 // THIS CODE IS WAY TOO MESSY, DON'T TRY TO UNDERSTAND IT
 void updateTFTDisplay(void *pvParameters) {
+  const int text_width = 12;      // Width of text (in pixels)
+  const int spacing_r2 = 25;      // Space between metrics
+  const int icon_r_margin = 6;    // Right margin for icons
+  const int start_y = 16;         // Starting y position for row 1
+  const int y_spacing = 20;       // Y spacing between rows
+  // Metric widths: Icon Width + Icon Right Margin + Text Width
+  const int bpm_width = 32 + (3 * text_width) + icon_r_margin;
+  const int temp_width = 32 + (4 * text_width) + icon_r_margin;  
+  const int spo2_width = 32 + (4 * text_width) + icon_r_margin; 
+  // Total width of metrics and spacing_r2
+  int total_width_r2 = bpm_width + spo2_width + (1 * spacing_r2);
+  // Calculate starting x position for centering
+  int start_x_r2 = (tft_width - total_width_r2) / 2;
+  int start_x_r1 = (tft_width - temp_width) / 2;
+  const int y_spacing_box = 25;   // Y spacing between message box and metrics 
+  const int message_box_padding = 4; // Padding for message box
+  const int msg_icon_r_margin = 8; // Right margin for message icon
+  int message_row_width = 15 * text_width + 2 * message_box_padding + 16 + msg_icon_r_margin; // 15 characters + x padding + icon width + icon right margin
+  int message_start_x = (tft_width - message_row_width) / 2;
   // clear
   tft.fillScreen(GC9A01A_BLACK);
   tft.setTextColor(GC9A01A_WHITE, GC9A01A_BLACK);
@@ -979,7 +990,7 @@ void reconnect() {
     #if DEBUG
     Serial.print("MQTT - Attempting MQTT connection...\n");
     #endif
-    if (mqttClient.connect(DEVICE_ID)) {
+    if (mqttClient.connect(DEVICE_ID, mqtt_username, mqtt_password)) {
       #if DEBUG
       Serial.println("MQTT - connected");
       #endif
@@ -1233,7 +1244,7 @@ void drawIconFromPROGMEM(int x, int y, const uint32_t* icon_data, int width, int
 void updateTime(void *pvParameters) {
   bool timeObtained = false;
   int refreshCounter = 0;
-
+  
   while (1) {
     // Refresh time from NTP based on the condition
     if (refreshCounter == 0) {

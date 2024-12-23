@@ -33,7 +33,22 @@ const Dashboard = () => {
         // use 'test.mosquitto.org' as a test broker
         // const client = new Paho.Client('test.mosquitto.org', 8080, '1A-guardian');
         // const client = new Paho.Client('broker.hivemq.com', 8884, '1A-guardian');
-        const client = new Paho.Client('broker.emqx.io', 8083, '1A-guardian');
+        // const client = new Paho.Client('broker.emqx.io', 8083, '1A-guardian');
+        const client = new Paho.Client('id1f113f.ala.asia-southeast1.emqxsl.com', 8084, '1A-guardian');
+
+        // Connect the client
+        client.connect({
+            useSSL: true,
+            userName: 'guardiband-mqtt',
+            password: 'guardiband',
+            onSuccess: () => {
+                console.log('Connected');
+                client.subscribe('guardiband/1A/data');
+            },
+            onFailure: (error) => {
+                console.log('Connection failed:', error);
+            },
+        });
 
         client.onConnectionLost = (responseObject) => {
             console.log('Connection lost:', responseObject.errorMessage);
@@ -96,17 +111,6 @@ const Dashboard = () => {
             }
         };
 
-        // Connect the client
-        client.connect({
-            onSuccess: () => {
-                console.log('Connected');
-                client.subscribe('guardiband/1A/data');
-            },
-            onFailure: (error) => {
-                console.log('Connection failed:', error);
-            },
-        });
-
         // Save the client to the ref
         clientRef.current = client;
 
@@ -164,7 +168,6 @@ const Dashboard = () => {
                     <View className="flex-1">
 
                         <MapView
-                            key={1}
                             onMapReady={() => setMapReady(true)}
                             initialRegion={{
                                 latitude: -6.2013465,
